@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
@@ -373,9 +374,73 @@ static short get_interpolated_sample(const short *sample_data, int inter_sample_
 	return (short)s;
 }
 
+static int clamp(int x, int min, int max) {
+	if (x < min) {
+		return min;
+	} else if (x > max) {
+		return max;
+	} else {
+		return x;
+	}
+}
+
+static short (*echo_buffer)[2] = NULL;
+static int echo_buffer_length = 0;
+static int echo_idx_max = 0;
+static int echo_idx = 0;
+static signed char fir_filter_coeffs[8] = {0};
+static short fir_filter_ring_buffer[8][2] = {0};
+static unsigned char fir_filter_ring_buffer_idx = 0;
+static int echo_feedback = 0;
+static BOOL echo_writes_enabled = FALSE;
+
+static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict outEchoLeft, int *restrict outEchoRight) {
+	fir_filter_ring_buffer[fir_filter_ring_buffer_idx][0] = echo_buffer[echo_idx][0] >> 1;
+	fir_filter_ring_buffer[fir_filter_ring_buffer_idx][1] = echo_buffer[echo_idx][1] >> 1;
+
+	// Use an unsigned short to ensure wrapping behavior
+	unsigned short filtered_sum_left = 0;
+	unsigned short filtered_sum_right = 0;
+	for (int i = 0; i < 7; ++i) {
+		filtered_sum_left  += fir_filter_coeffs[i] * fir_filter_ring_buffer[(fir_filter_ring_buffer_idx - 7 + i) & 7][0] >> 6;
+		filtered_sum_right += fir_filter_coeffs[i] * fir_filter_ring_buffer[(fir_filter_ring_buffer_idx - 7 + i) & 7][1] >> 6;
+	}
+
+	// But the final addition saturates, instead of wrapping
+	int filtered_sum_left_final = (short)filtered_sum_left +
+	        (fir_filter_coeffs[7] * fir_filter_ring_buffer[fir_filter_ring_buffer_idx][0] >> 6);
+	filtered_sum_left_final = clamp(filtered_sum_left_final, -32768, 32767);
+
+	int filtered_sum_right_final = (short)filtered_sum_right +
+	        (fir_filter_coeffs[7] * fir_filter_ring_buffer[fir_filter_ring_buffer_idx][1] >> 6);
+	filtered_sum_right_final = clamp(filtered_sum_right_final, -32768, 32767);
+
+	newEchoLeft += (filtered_sum_left_final * echo_feedback >> 7);
+	newEchoLeft &= ~1;
+	newEchoRight += (filtered_sum_right_final * echo_feedback >> 7);
+	newEchoRight &= ~1;
+
+	if (echo_writes_enabled) {
+		echo_buffer[echo_idx][0] = newEchoLeft;
+		echo_buffer[echo_idx][1] = newEchoRight;
+	}
+
+	++fir_filter_ring_buffer_idx;
+	fir_filter_ring_buffer_idx &= 7;
+	++echo_idx;
+	if (echo_idx >= echo_idx_max) {
+		echo_idx = 0;
+		echo_idx_max = (state.edl * 512) * mixrate / 32000;
+	}
+
+	*outEchoLeft = filtered_sum_left_final;
+	*outEchoRight = filtered_sum_right_final;
+}
+
+
 //DWORD cnt;
 
-static void fill_buffer() {
+static void fill_buffer(void) {
 	short (*bufp)[2] = (short (*)[2])curbuf->lpData;
 
 	if (hwndTracker != NULL)
@@ -392,7 +457,7 @@ static void fill_buffer() {
 		}
 
 //		for (int blah = 0; blah < 50; blah++) {
-		int left = 0, right = 0;
+		int mainLeft = 0, mainRight = 0, newEchoLeft = 0, newEchoRight = 0;
 		struct channel_state *c = state.chan;
 		for (int cm = chmask; cm; c++, cm >>= 1) {
 			if (!(cm & 1)) continue;
@@ -420,9 +485,20 @@ static void fill_buffer() {
 			// Linear interpolation between envelope ticks
 			int env_height = c->env_height +
 				(long long)(c->next_env_height - c->env_height) * c->env_fractional_counter / mixrate;
-			left  += s1 * env_height / 0x800 * c->left_vol  / 128;
-			right += s1 * env_height / 0x800 * c->right_vol / 128;
+			// Shift channel volume left by 7, instead of 6, because we already made s1 16-bit
+			int sLeft  = (s1 * env_height >> 11) * c->left_vol >> 7;
+			int sRight = (s1 * eng_height >> 11) * c->right_vol >> 7;
+			mainLeft  += sLeft;
+			mainLeft = clamp(mainLeft, -32768, 32767);
+			mainRight += sRight;
+			mainRight = clamp(mainRight, -32768, 32767);
 
+			if (c->echo_on) {
+				newEchoLeft += sLeft;
+				newEchoLeft = clamp(newEchoLeft, -32768, 32767);
+				newEchoRight += sRight;
+				newEchoRight = clamp(newEchoRight, -32768, 32767);
+			}
 //			int sp = c->samp_pos;
 
 			c->samp_pos += c->note_freq;
@@ -434,10 +510,14 @@ static void fill_buffer() {
 			}
 //			if (blah != 1) c->samp_pos = sp;
 		}
-		if (left < -32768) left = -32768;
-		else if (left > 32767) left = 32767;
-		if (right < -32768) right = -32768;
-		else if (right > 32767) right = 32767;
+
+		int echoLeft = 0, echoRight = 0;
+		getNextEchoSample(newEchoLeft, newEchoRight, &echoLeft, &echoRight);
+		int left = (mainLeft * 0x70 >> 7) + (echoLeft * state.echo_left_vol >> 7);
+		left = clamp(left, -32768, 32767);
+		int right = (mainRight * 0x70 >> 7) + (echoRight * state.echo_right_vol >> 7);
+		right = clamp(right, -32768, 32767);
+
 		(*bufp)[0] = left;
 		(*bufp)[1] = right;
 //		}
