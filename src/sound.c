@@ -391,22 +391,30 @@ static int echo_idx = 0;
 static signed char fir_filter_coeffs[8] = {0};
 static short fir_filter_ring_buffer[8][2] = {0};
 static unsigned char fir_filter_ring_buffer_idx = 0;
+static int echo_delay = 1;
 static int echo_feedback = 0;
-static BOOL echo_writes_enabled = FALSE;
+static BOOL skip_echo_writes = TRUE;
 
 static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict outEchoLeft, int *restrict outEchoRight) {
+	// Add the saved echo sample to the ring buffer. (We have to use an extra buffer and not just the echo buffer itself,
+	// because the lowest echo buffer setting is just 1 stereo sample.)
 	fir_filter_ring_buffer[fir_filter_ring_buffer_idx][0] = echo_buffer[echo_idx][0] >> 1;
 	fir_filter_ring_buffer[fir_filter_ring_buffer_idx][1] = echo_buffer[echo_idx][1] >> 1;
 
+	// Apply the filter to the last 8 samples; the first FIR filter entry gets multiplied by the oldest sample
 	// Use an unsigned short to ensure wrapping behavior
 	unsigned short filtered_sum_left = 0;
 	unsigned short filtered_sum_right = 0;
 	for (int i = 0; i < 7; ++i) {
+		// Only shift right by 6, instead of 7, because the echo samples are 15-bit in the ring buffer.
+		// There's no division by 8 at the end baked into this step. Using reasonable values is the filter's job.
+		// With the identity filter, -0x4000 * 0x7F >> 6 == -0x7F00, which is close to the maximum of -0x8000.
+		// `fir_filter_ring_buffer_idx` denotes the most recent sample index, so the oldest sample is `idx - 7` (wrapping around).
 		filtered_sum_left  += fir_filter_coeffs[i] * fir_filter_ring_buffer[(fir_filter_ring_buffer_idx - 7 + i) & 7][0] >> 6;
 		filtered_sum_right += fir_filter_coeffs[i] * fir_filter_ring_buffer[(fir_filter_ring_buffer_idx - 7 + i) & 7][1] >> 6;
 	}
 
-	// But the final addition saturates, instead of wrapping
+	// The final addition saturates, instead of wrapping, so handle it separately.
 	int filtered_sum_left_final = (short)filtered_sum_left +
 	        (fir_filter_coeffs[7] * fir_filter_ring_buffer[fir_filter_ring_buffer_idx][0] >> 6);
 	filtered_sum_left_final = clamp(filtered_sum_left_final, -32768, 32767);
@@ -415,24 +423,30 @@ static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict o
 	        (fir_filter_coeffs[7] * fir_filter_ring_buffer[fir_filter_ring_buffer_idx][1] >> 6);
 	filtered_sum_right_final = clamp(filtered_sum_right_final, -32768, 32767);
 
+	// This old, filtered audio augments the new audio (truncated to 15 bits by clearing the least significant bit)...
 	newEchoLeft += (filtered_sum_left_final * echo_feedback >> 7);
-	newEchoLeft &= ~1;
+	newEchoLeft >>= 1;
+	newEchoLeft *= 2;
 	newEchoRight += (filtered_sum_right_final * echo_feedback >> 7);
-	newEchoRight &= ~1;
+	newEchoRight >>= 1;
+	newEchoRight *= 2;
 
-	if (echo_writes_enabled) {
+	// ...and this augmented version is saved, but not immediately used.
+	if (!skip_echo_writes) {
 		echo_buffer[echo_idx][0] = newEchoLeft;
 		echo_buffer[echo_idx][1] = newEchoRight;
 	}
 
+	// (Set up indexes to place the next sample the next time this function is called.)
 	++fir_filter_ring_buffer_idx;
 	fir_filter_ring_buffer_idx &= 7;
 	++echo_idx;
 	if (echo_idx >= echo_idx_max) {
 		echo_idx = 0;
-		echo_idx_max = (state.edl * 512) * mixrate / 32000;
+		echo_idx_max = (echo_delay * 512) * mixrate / 32000;
 	}
 
+	// What we *do* immediately use is the old, filtered audio.
 	*outEchoLeft = filtered_sum_left_final;
 	*outEchoRight = filtered_sum_right_final;
 }
@@ -513,9 +527,9 @@ static void fill_buffer(void) {
 
 		int echoLeft = 0, echoRight = 0;
 		getNextEchoSample(newEchoLeft, newEchoRight, &echoLeft, &echoRight);
-		int left = (mainLeft * 0x70 >> 7) + (echoLeft * state.echo_left_vol >> 7);
+		int left = (mainLeft * 0x70 >> 7) + (echoLeft * (state.echo_left_vol.cur >> 8) >> 7);
 		left = clamp(left, -32768, 32767);
-		int right = (mainRight * 0x70 >> 7) + (echoRight * state.echo_right_vol >> 7);
+		int right = (mainRight * 0x70 >> 7) + (echoRight * (state.echo_right_vol.cur >> 8) >> 7);
 		right = clamp(right, -32768, 32767);
 
 		(*bufp)[0] = left;

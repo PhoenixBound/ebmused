@@ -135,6 +135,23 @@ static int calc_vib_disp(struct channel_state *c, int phase) {
 	return disp;                     /*   \/ */
 }
 
+static void set_echo_filter(int filter) {
+	static const signed char fir_filters[32][8] {
+		// Identity filter (no change)
+		{ 0x7F,  0x00,  0x00,  0x00,  0x00,  0x00,  0x00,  0x00},
+		// High-pass filter
+		{ 0x58, -0x41, -0x25, -0x10, -0x02,  0x07,  0x0C,  0x0C},
+		// Low-pass filter
+		{ 0x0C,  0x21,  0x2B,  0x2B,  0x13, -0x02, -0x0D, -0x07},
+		// Band-pass filter
+		{ 0x34,  0x33,  0x00, -0x27, -0x1B,  0x01, -0x04, -0x15},
+		// TODO: include data after the table of 4 filters? For now, leave it zeroed
+	};
+
+	signed char *filter = fir_filters[filter & 0x1F];
+	dsp_set_coefs(filter);
+}
+
 // do a Ex/Fx code
 static void do_command(struct song_state *st, struct channel_state *c) {
 	unsigned char *p = c->ptr;
@@ -213,6 +230,24 @@ static void do_command(struct song_state *st, struct channel_state *c) {
 			break;
 		case 0xF4:
 			c->finetune = p[1];
+			break;
+		case 0xF5:
+			for (int i = 0; i < 8; ++i) {
+				st->chan[i].echo_on = (p[1] & (1 << i)) != 0;
+			}
+			st->echo_volume_left.cur = p[2] << 8;
+			st->echo_volume_right.cur = p[3] << 8;
+			st->skip_echo_writes = FALSE;
+			break;
+		case 0xF6:
+			st->echo_volume_left.cur = 0;
+			st->echo_volume_right.cur = 0;
+			st->skip_echo_writes = TRUE;
+			break;
+		case 0xF7:
+			set_echo_delay(p[1]);
+			st->echo_feedback = p[2];
+			set_echo_filter(p[3]);
 			break;
 		case 0xF9: {
 			c->cur_port_start_ctr = p[1];

@@ -101,8 +101,12 @@ struct song_state {
 		short gain_rate;
 	} chan[INST_MAX_POLYPHONY];
 	signed char transpose;
+	signed char echo_feedback;
+	BOOL skip_echo_writes;
 	struct slider volume;
 	struct slider tempo;
+	struct slider echo_volume_left;
+	struct slider echo_volume_right;
 	int next_timer_tick, cycle_timer;
 	BYTE first_CA_inst; // set with FA
 	BYTE repeat_count;
