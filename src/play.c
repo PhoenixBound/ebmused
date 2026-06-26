@@ -135,8 +135,32 @@ static int calc_vib_disp(struct channel_state *c, int phase) {
 	return disp;                     /*   \/ */
 }
 
+static void set_echo_delay(unsigned char delay) {
+	state.echo_delay = delay;
+	unsigned char current_delay = dsp_get_edl();
+	if (current_delay != delay) {
+		if (state.echo_counter < 0) {
+			// This may overflow, if someone plays a song with a bunch of
+			// F7 commands in a row (don't do that), but it doesn't cause UB.
+			// All that happens is echo gets enabled a little too early...
+			state.echo_counter -= (current_delay & 0x0F) + 1;
+		} else {
+			state.echo_counter = -((current_delay & 0x0F) + 1);
+		}
+		dsp_set_eon(0);
+		dsp_set_efb(0);
+		dsp_set_evolr(0);
+		dsp_set_evoll(0);
+		// TODO: write the real noise clock value here
+		dsp_set_flg(TRUE, 0);
+		dsp_set_edl_esa(delay, 0xFF - delay * 8);
+	} else {
+		// dsp_set_esa(0xFF - delay * 8);
+	}
+}
+
 static void set_echo_filter(int filter) {
-	static const signed char fir_filters[32][8] {
+	static const signed char fir_filters[32][8] = {
 		// Identity filter (no change)
 		{ 0x7F,  0x00,  0x00,  0x00,  0x00,  0x00,  0x00,  0x00},
 		// High-pass filter
@@ -148,8 +172,8 @@ static void set_echo_filter(int filter) {
 		// TODO: include data after the table of 4 filters? For now, leave it zeroed
 	};
 
-	signed char *filter = fir_filters[filter & 0x1F];
-	dsp_set_coefs(filter);
+	const signed char *f = fir_filters[filter & 0x1F];
+	dsp_set_coefs(f);
 }
 
 // do a Ex/Fx code
@@ -232,11 +256,9 @@ static void do_command(struct song_state *st, struct channel_state *c) {
 			c->finetune = p[1];
 			break;
 		case 0xF5:
-			for (int i = 0; i < 8; ++i) {
-				st->chan[i].echo_on = (p[1] & (1 << i)) != 0;
-			}
-			st->echo_volume_left.cur = p[2] << 8;
-			st->echo_volume_right.cur = p[3] << 8;
+			st->queued_echo_on_channels = p[1];
+			st->echo_volume_left.cur = (signed char)p[2] * 0x100;
+			st->echo_volume_right.cur = (signed char)p[3] * 0x100;
 			st->skip_echo_writes = FALSE;
 			break;
 		case 0xF6:
@@ -249,6 +271,10 @@ static void do_command(struct song_state *st, struct channel_state *c) {
 			st->echo_feedback = p[2];
 			set_echo_filter(p[3]);
 			break;
+        case 0xF8:
+            make_slider(&st->echo_volume_left, p[1], p[2]);
+            make_slider(&st->echo_volume_right, p[1], p[3]);
+            break;
 		case 0xF9: {
 			c->cur_port_start_ctr = p[1];
 			int target = p[3] + st->transpose;
@@ -459,6 +485,8 @@ static BOOL do_cycle(struct song_state *st) {
 	st->patpos++;
 
 	slide(&st->tempo);
+	slide(&st->echo_volume_left);
+	slide(&st->echo_volume_right);
 	slide(&st->volume);
 
 	for (c = &st->chan[0]; c != &st->chan[8]; c++) {
@@ -543,7 +571,33 @@ static void do_sub_cycle(struct song_state *st) {
 	}
 }
 
+// $054A
+void write_timer_dsp_regs(void) {
+	// Write key-off bits (not handled here currently)
+	// Write pitch modulation (never messed with)
+	// Write noise-on bits (we don't even implement noise)
+	// Zero out key-off bits
+	// Write key-on bits (not handled here currently)
+	if (state.echo_counter < 0) {
+		// Set various flags and the noise clock
+		dsp_set_flg(state.skip_echo_writes, 0);
+		if (state.echo_counter == state.echo_delay) {
+			dsp_set_eon(state.queued_echo_on_channels);
+			dsp_set_efb(state.echo_feedback);
+			dsp_set_evolr(state.echo_volume_right.cur >> 8);
+			dsp_set_evoll(state.echo_volume_left.cur >> 8);
+		}
+	}
+}
+
 BOOL do_timer() {
+	// Advance the echo/SFX timer
+	state.echo_cycle_timer += 0x20;
+	if (state.echo_cycle_timer >= 256) {
+		state.echo_cycle_timer -= 256;
+		++state.echo_counter;
+	}
+
 	state.cycle_timer += state.tempo.cur >> 8;
 	if (state.cycle_timer >= 256) {
 		state.cycle_timer -= 256;
@@ -555,6 +609,7 @@ BOOL do_timer() {
 	} else {
 		do_sub_cycle(&state);
 	}
+	write_timer_dsp_regs();
 	return TRUE;
 }
 
@@ -579,4 +634,6 @@ void initialize_state() {
 		stop_playing();
 		EnableMenuItem(hmenu, ID_PLAY, MF_ENABLED);
 	}
+
+	write_timer_dsp_regs();
 }

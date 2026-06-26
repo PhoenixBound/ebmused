@@ -200,6 +200,14 @@ void order_delete(int pos);
 // sound.c
 extern int mixrate;
 extern int chmask;
+void dsp_set_eon(unsigned char eon);
+void dsp_set_evoll(signed char evoll);
+void dsp_set_evolr(signed char evolr);
+void dsp_set_efb(signed char efb);
+void dsp_set_edl_esa(unsigned char edl, unsigned char esa);
+unsigned char dsp_get_edl(void);
+void dsp_set_flg(BOOL skip_echo_writes, unsigned char noise_clock);
+void dsp_set_coefs(const signed char *coefs);
 BOOL is_playing(void);
 BOOL start_playing(void);
 void stop_playing(void);

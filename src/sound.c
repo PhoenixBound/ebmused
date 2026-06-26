@@ -31,6 +31,17 @@ int timer_speed = 500;
 HWAVEOUT hwo;
 static BOOL song_playing = FALSE;
 FILE* wav_file = NULL;
+static short (*echo_buffer)[2] = NULL;
+static int echo_buffer_chunk_length = 0;
+static int echo_idx = 0;
+static signed char fir_filter_coeffs[8] = {0};
+static short fir_filter_ring_buffer[8][2] = {0};
+static unsigned char fir_filter_ring_buffer_idx = 0;
+static unsigned char echo_on_flags = 0;
+static signed char echo_volume_left = 0, echo_volume_right = 0;
+static int echo_delay = 1;
+static int echo_feedback = 0;
+static BOOL skip_echo_writes = TRUE;
 
 BOOL is_playing(void) { return song_playing; }
 BOOL start_playing(void) {
@@ -58,6 +69,15 @@ int sound_init() {
 		return 0;
 	}
 
+	// Round down to ensure that clearing the echo buffer to 0 never has leftovers
+	// that aren't cleared
+	echo_buffer_chunk_length = 512 * mixrate / 32000;
+	echo_buffer = calloc(echo_buffer_chunk_length, sizeof(short[2]));
+	if (!echo_buffer) {
+		MessageBox2("Echo buffer allocation failed", NULL, MB_ICONERROR);
+		return 0;
+	}
+
 	wfx.wFormatTag = WAVE_FORMAT_PCM;
 	wfx.nChannels = 2;
 	wfx.nSamplesPerSec = mixrate;
@@ -69,6 +89,8 @@ int sound_init() {
 	int error = waveOutOpen(&hwo, WAVE_MAPPER, &wfx, (DWORD_PTR)hwndMain, 0, CALLBACK_WINDOW);
 	if (error) {
 		char buf[60];
+		free(echo_buffer);
+		echo_buffer = NULL;
 		sprintf(buf, "waveOut device could not be opened (%d)", error);
 		MessageBox2(buf, NULL, MB_ICONERROR);
 		return 0;
@@ -150,6 +172,8 @@ static void sound_uninit() {
 	waveOutClose(hwo);
 	free(wh[0].lpData);
 	hwo = NULL;
+	free(echo_buffer);
+	echo_buffer = NULL;
 }
 
 // Move the envelope forward enough SNES ticks to match one tick of ebmused.
@@ -384,16 +408,46 @@ static int clamp(int x, int min, int max) {
 	}
 }
 
-static short (*echo_buffer)[2] = NULL;
-static int echo_buffer_length = 0;
-static int echo_idx_max = 0;
-static int echo_idx = 0;
-static signed char fir_filter_coeffs[8] = {0};
-static short fir_filter_ring_buffer[8][2] = {0};
-static unsigned char fir_filter_ring_buffer_idx = 0;
-static int echo_delay = 1;
-static int echo_feedback = 0;
-static BOOL skip_echo_writes = TRUE;
+void dsp_set_coefs(const signed char *coefs) {
+	for (int i = 0; i < 8; ++i) {
+		fir_filter_coeffs[i] = coefs[i];
+	}
+}
+
+void dsp_set_eon(unsigned char eon) {
+	echo_on_flags = eon;
+}
+
+void dsp_set_evoll(signed char evoll) {
+	echo_volume_left = evoll;
+}
+
+void dsp_set_evolr(signed char evolr) {
+	echo_volume_right = evolr;
+}
+
+void dsp_set_efb(signed char efb) {
+	echo_feedback = efb;
+}
+
+void dsp_set_edl_esa(unsigned char edl, unsigned char esa) {
+	edl &= 0xF;
+	echo_delay = edl;
+	// EarthBound always sets ESA to $FF - (8*EDL) immediately after confirming EDL's value,
+	// so we don't need to convert it to an index or anything.
+	// esa -= 0xFF - 8 * 0xF;
+	(void)esa;
+}
+
+unsigned char dsp_get_edl(void) {
+	return echo_delay;
+}
+
+void dsp_set_flg(BOOL echo_writes_flag, unsigned char noise_clock) {
+	skip_echo_writes = !!echo_writes_flag;
+	// TODO: use noise clock value
+	(void)noise_clock;
+}
 
 static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict outEchoLeft, int *restrict outEchoRight) {
 	// Add the saved echo sample to the ring buffer. (We have to use an extra buffer and not just the echo buffer itself,
@@ -441,9 +495,13 @@ static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict o
 	++fir_filter_ring_buffer_idx;
 	fir_filter_ring_buffer_idx &= 7;
 	++echo_idx;
-	if (echo_idx >= echo_idx_max) {
-		echo_idx = 0;
-		echo_idx_max = (echo_delay * 512) * mixrate / 32000;
+	if (echo_idx >= 15 * echo_buffer_chunk_length) {
+		// This is where the echo start address would point for EarthBound
+		echo_idx = (15 - echo_delay) * echo_buffer_chunk_length;
+		// Handle the delay = 0 case properly
+		if (echo_idx == 15 * echo_buffer_chunk_length) {
+			--echo_idx;
+		}
 	}
 
 	// What we *do* immediately use is the old, filtered audio.
@@ -473,7 +531,7 @@ static void fill_buffer(void) {
 //		for (int blah = 0; blah < 50; blah++) {
 		int mainLeft = 0, mainRight = 0, newEchoLeft = 0, newEchoRight = 0;
 		struct channel_state *c = state.chan;
-		for (int cm = chmask; cm; c++, cm >>= 1) {
+		for (int ci = 0, cm = chmask; cm; c++, ci++, cm >>= 1) {
 			if (!(cm & 1)) continue;
 
 			if (c->samp_pos < 0) continue;
@@ -501,13 +559,13 @@ static void fill_buffer(void) {
 				(long long)(c->next_env_height - c->env_height) * c->env_fractional_counter / mixrate;
 			// Shift channel volume left by 7, instead of 6, because we already made s1 16-bit
 			int sLeft  = (s1 * env_height >> 11) * c->left_vol >> 7;
-			int sRight = (s1 * eng_height >> 11) * c->right_vol >> 7;
+			int sRight = (s1 * env_height >> 11) * c->right_vol >> 7;
 			mainLeft  += sLeft;
 			mainLeft = clamp(mainLeft, -32768, 32767);
 			mainRight += sRight;
 			mainRight = clamp(mainRight, -32768, 32767);
 
-			if (c->echo_on) {
+			if (ci < 8 && (echo_on_flags >> ci & 1)) {
 				newEchoLeft += sLeft;
 				newEchoLeft = clamp(newEchoLeft, -32768, 32767);
 				newEchoRight += sRight;
@@ -527,9 +585,9 @@ static void fill_buffer(void) {
 
 		int echoLeft = 0, echoRight = 0;
 		getNextEchoSample(newEchoLeft, newEchoRight, &echoLeft, &echoRight);
-		int left = (mainLeft * 0x70 >> 7) + (echoLeft * (state.echo_left_vol.cur >> 8) >> 7);
+		int left = (mainLeft * 0x70 >> 7) + (echoLeft * echo_volume_left >> 7);
 		left = clamp(left, -32768, 32767);
-		int right = (mainRight * 0x70 >> 7) + (echoRight * (state.echo_right_vol.cur >> 8) >> 7);
+		int right = (mainRight * 0x70 >> 7) + (echoRight * echo_volume_right >> 7);
 		right = clamp(right, -32768, 32767);
 
 		(*bufp)[0] = left;
