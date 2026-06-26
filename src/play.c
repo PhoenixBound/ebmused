@@ -578,7 +578,7 @@ void write_timer_dsp_regs(void) {
 	// Write noise-on bits (we don't even implement noise)
 	// Zero out key-off bits
 	// Write key-on bits (not handled here currently)
-	if (state.echo_counter < 0) {
+	if (state.echo_counter >= 0) {
 		// Set various flags and the noise clock
 		dsp_set_flg(state.skip_echo_writes, 0);
 		if (state.echo_counter == state.echo_delay) {
@@ -595,7 +595,9 @@ BOOL do_timer() {
 	state.echo_cycle_timer += 0x20;
 	if (state.echo_cycle_timer >= 256) {
 		state.echo_cycle_timer -= 256;
-		++state.echo_counter;
+		if (state.echo_counter != state.echo_delay) {
+			++state.echo_counter;
+		}
 	}
 
 	state.cycle_timer += state.tempo.cur >> 8;
@@ -635,5 +637,7 @@ void initialize_state() {
 		EnableMenuItem(hmenu, ID_PLAY, MF_ENABLED);
 	}
 
+	set_echo_delay(1);
+	set_echo_filter(0);
 	write_timer_dsp_regs();
 }

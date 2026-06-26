@@ -72,7 +72,7 @@ int sound_init() {
 	// Round down to ensure that clearing the echo buffer to 0 never has leftovers
 	// that aren't cleared
 	echo_buffer_chunk_length = 512 * mixrate / 32000;
-	echo_buffer = calloc(echo_buffer_chunk_length, sizeof(short[2]));
+	echo_buffer = calloc(15, echo_buffer_chunk_length * sizeof(short[2]));
 	if (!echo_buffer) {
 		MessageBox2("Echo buffer allocation failed", NULL, MB_ICONERROR);
 		return 0;
@@ -450,6 +450,8 @@ void dsp_set_flg(BOOL echo_writes_flag, unsigned char noise_clock) {
 }
 
 static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict outEchoLeft, int *restrict outEchoRight) {
+	assert(0 <= echo_idx && echo_idx < 15 * echo_buffer_chunk_length);
+
 	// Add the saved echo sample to the ring buffer. (We have to use an extra buffer and not just the echo buffer itself,
 	// because the lowest echo buffer setting is just 1 stereo sample.)
 	fir_filter_ring_buffer[fir_filter_ring_buffer_idx][0] = echo_buffer[echo_idx][0] >> 1;
@@ -503,6 +505,8 @@ static void getNextEchoSample(int newEchoLeft, int newEchoRight, int *restrict o
 			--echo_idx;
 		}
 	}
+
+	assert(0 <= echo_idx && echo_idx < 15 * echo_buffer_chunk_length);
 
 	// What we *do* immediately use is the old, filtered audio.
 	*outEchoLeft = filtered_sum_left_final;
