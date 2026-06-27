@@ -270,6 +270,7 @@ static void do_command(struct song_state *st, struct channel_state *c) {
 			set_echo_delay(p[1]);
 			st->echo_feedback = p[2];
 			set_echo_filter(p[3]);
+			st->echo_filter = p[3];
 			break;
         case 0xF8:
             make_slider(&st->echo_volume_left, p[1], p[2]);

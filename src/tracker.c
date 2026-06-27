@@ -60,6 +60,8 @@ static const struct control_desc state_controls[] = {
 };
 static struct window_template state_template = { 2, 2, 0, 0, state_controls };
 
+static HWND channel_checkboxes[8] = {};
+
 static int pos_width, font_height;
 static const BYTE zoom_levels[] = { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96 };
 static int zoom = 6, zoom_idx = 4;
@@ -357,6 +359,7 @@ LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 			HWND b = CreateWindow("Button", buf,
 				WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0,
 				hWnd, (HMENU)(IDC_ENABLE_CHANNEL_0 + i), hinstance, NULL);
+			channel_checkboxes[i] = b;
 			SendMessage(b, BM_SETCHECK, chmask >> i & 1, 0);
 			// This font was set up earlier by the ebmused_order control
 			SendMessage(b, WM_SETFONT, order_font(), 0);
@@ -385,6 +388,9 @@ LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 	case WM_DESTROY:
 		save_cur_song_to_pack();
 		enable_menu_items(editor_menu_cmds, MF_GRAYED);
+		for (int i = 0; i < 8; ++i) {
+			channel_checkboxes[i] = NULL;
+		}
 		break;
 	case WM_COMMAND: {
 		int id = LOWORD(wParam);
@@ -1443,6 +1449,12 @@ static void show_oscillator_state(int pos, BYTE start, BYTE speed, BYTE range) {
 	show_state(pos, buf);
 }
 
+static void show_echo_state(int pos, BYTE channels, BYTE delay, BYTE feedback, BYTE filter) {
+	char buf[12];
+	sprintf(buf, "%02X %02X %02X %02X", channels, delay, feedback, filter);
+	show_state(pos, buf);
+}
+
 static void CALLBACK MidiInProc(HMIDIIN handle, UINT wMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2) {
 	if (wMsg == MIM_DATA)
 	{
@@ -1467,7 +1479,7 @@ static void CALLBACK MidiInProc(HMIDIIN handle, UINT wMsg, DWORD_PTR dwInstance,
 
 LRESULT CALLBACK StateWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	static const char *const gs[] = {
-		"Volume:", "Tempo:", "Transpose:", "CA inst.:"
+		"Volume:", "Tempo:", "Transpose:", "CA inst.:", "Echo:"
 	};
 	static const char *const cs1[] = {
 		"Volume:", "Panning:", "Transpose:",
@@ -1490,7 +1502,7 @@ LRESULT CALLBACK StateWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 		hdcState = (HDC)wParam;
 		set_up_hdc(hdcState);
 		int i;
-		for (i = 0x01; i <= 0x04; i++) show_state(i, gs[i-0x01]);
+		for (i = 0x01; i <= 0x05; i++) show_state(i, gs[i-0x01]);
 		for (i = 0x21; i <= 0x26; i++) show_state(i, cs1[i-0x21]);
 		for (i = 0x41; i <= 0x46; i++) show_state(i, cs2[i-0x41]);
 		reset_hdc(hdcState);
@@ -1505,6 +1517,9 @@ LRESULT CALLBACK StateWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 		show_slider_state(0x12, &state.tempo);
 		show_simple_state(0x13, state.transpose);
 		show_simple_state(0x14, state.first_CA_inst);
+		show_echo_state(0x15, state.queued_echo_on_channels, state.echo_delay, state.echo_feedback, state.echo_filter);
+		show_slider_state(0x06, &state.echo_volume_left);
+		show_slider_state(0x16, &state.echo_volume_right);
 
 		struct channel_state *c = &state.chan[cursor_chan];
 		show_slider_state(0x31, &c->volume);
@@ -1530,6 +1545,17 @@ LRESULT CALLBACK StateWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 		show_state(0x56, buf);
 		reset_hdc(hdcState);
 		EndPaint(hWnd, &ps);
+		for (int i = 0; i < 8; ++i) {
+			if (channel_checkboxes[i]) {
+				strcpy(buf, "0 (Echo)");
+				buf[0] += i;
+				int echo_enabled_for_channel = (state.queued_echo_on_channels >> i) & 1;
+				if (!echo_enabled_for_channel) {
+					buf[1] = '\0';
+				}
+				SendMessage(channel_checkboxes[i], WM_SETTEXT, 0, (LPARAM)buf);
+			}
+		}
 		break;
 	}
 	case WM_DESTROY:

@@ -102,7 +102,8 @@ struct song_state {
 	} chan[INST_MAX_POLYPHONY];
 	signed char transpose;
 	signed char echo_feedback;
-	unsigned char queued_echo_on_channels;
+	BYTE echo_filter;
+	BYTE queued_echo_on_channels;
 	signed char echo_delay;
 	signed char echo_counter;
 	BOOL skip_echo_writes;
